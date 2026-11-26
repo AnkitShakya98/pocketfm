@@ -1,37 +1,3 @@
-"""
-pocketfm_api.py
-───────────────
-PocketFM API client — talks to the **real** internal API that pocketfm.com's
-own website (Next.js, App Router) uses for search and episode listing.
-
-This replaces the earlier version of this file, which guessed at a mobile-app
-REST API (api.pocketfm.in /v4 /v5) that turned out to not exist (confirmed
-404 on every guessed route). The endpoints below were captured directly from
-pocketfm.com's own network traffic and are confirmed working.
-
-How it works
-────────────
-pocketfm.com is a Next.js app. Instead of a normal REST API, search and the
-show/episode list are implemented as **Next.js Server Actions**: the browser
-POSTs to the page URL itself (e.g. "/" for search, "/show/<id>" for episode
-list) with special headers:
-    - Accept: text/x-component
-    - next-action: <per-build action hash>
-    - next-router-state-tree: <url-encoded JSON describing the current route>
-and a JSON array body of the action's arguments.
-
-The response is a React Server Components "Flight" stream: newline-separated
-chunks shaped like "<index>:<json-or-reference>". The chunk holding the
-actual payload is referenced from chunk "0" (e.g. "a":"$@1" → chunk "1" has
-the data). `_parse_rsc_stream()` below decodes that.
-
-Caveat: `next-action` hashes are generated per deployment build of
-pocketfm.com. If pocketfm.com redeploys, these hashes can change and this
-file will need the same network-capture process repeated (browser dev tools
-→ Network tab → trigger a search / open a show → copy the new `next-action`
-value and request body shape).
-"""
-
 import http.cookiejar
 import json
 import logging
@@ -219,6 +185,7 @@ def _rsc_post(path: str, action: str, router_state_tree: str, payload: list, ref
         try:
             r = _session.post(url, headers=headers, data=body, timeout=20, cookies=cookies)
             r.raise_for_status()
+            r.encoding = "utf-8"
             return _parse_rsc_stream(r.text)
         except requests.exceptions.HTTPError as e:
             logger.warning(f"POST {url} → HTTP {e.response.status_code} (attempt {attempt+1})")
@@ -248,6 +215,7 @@ def _rsc_get(path: str, router_state_tree: str, referer: str) -> dict:
         try:
             r = _session.get(url, headers=headers, timeout=25)
             r.raise_for_status()
+            r.encoding = "utf-8" 
             return _parse_rsc_stream(r.text)
         except requests.exceptions.HTTPError as e:
             logger.warning(f"GET {url} → HTTP {e.response.status_code} (attempt {attempt+1})")
@@ -299,12 +267,6 @@ def _lang_hint(lang: Optional[str]):
 
 
 def search_shows(query: str, lang: Optional[str] = None) -> list:
-    """
-    Search PocketFM shows via pocketfm.com's homepage search action.
-    Returns the raw list of entity dicts (as sent by pocketfm.com) —
-    pass to parse_search_results() to normalize. `lang` (e.g. "tamil") asks the
-    site for that language; None = the site's default.
-    """
     headers, cookies = _lang_hint(lang)
     chunks = _rsc_post(
         "/",
@@ -315,8 +277,15 @@ def search_shows(query: str, lang: Optional[str] = None) -> list:
         extra_headers=headers,
         cookies=cookies,
     )
-    data = chunks.get("1")
-    return data if isinstance(data, list) else []
+    meta = chunks.get("0")
+    if isinstance(meta, dict) and str(meta.get("a", "")).startswith("$@"):
+        data = chunks.get(meta["a"][2:])
+        if isinstance(data, list):
+            return data
+    for v in chunks.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict) and "entity_id" in v[0]:
+            return v
+    return []
 
 
 def search_multi(query: str, lang: Optional[str] = None) -> list:
